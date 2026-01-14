@@ -1,27 +1,23 @@
 package vault.x.org
 
 import android.app.Activity
-import android.app.RecoverableSecurityException
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.media.ThumbnailUtils
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.provider.MediaStore
-import android.provider.OpenableColumns
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectTransformGestures
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,53 +25,74 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
-import androidx.compose.material3.pulltorefresh.PullToRefreshContainer
-import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collect
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
 import java.io.File
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.*
 import kotlin.math.floor
 
-enum class Screen { HOME, RECYCLE_BIN, BROWSER, DUPLICATES, SETTINGS, AI_FILTER }
+enum class Screen { HOME, RECYCLE_BIN, MAP_VIEW }
+enum class ViewMode { LIST, GRID, TINY }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun HomeScreen(userPin: String) {
     val context = LocalContext.current
+    val activity = context as? Activity
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
 
+    // MANAGERS
     val crypto = remember { CryptoManager(context) }
-    val indexManager = remember { IndexManager(context, crypto) }
     val vaultManager = remember { VaultManager(context) }
+    val fileManager = remember { FileManager(context, crypto) }
     val thumbManager = remember { ThumbnailManager(context, crypto) }
-    val aiScanner = remember { AiScanner(context) }
+    val metaManager = remember { MetadataManager(context, crypto) }
+    val workManager = remember { WorkManager.getInstance(context) }
 
     // STATE
     var currentScreen by remember { mutableStateOf(Screen.HOME) }
     var currentFolderId by remember { mutableStateOf<String?>(null) }
-    var aiFilterTag by remember { mutableStateOf<String?>(null) }
+
+    // VIEW OPTIONS
+    var viewMode by remember { mutableStateOf(ViewMode.GRID) }
+    var showDates by remember { mutableStateOf(true) }
+    var showViewMenu by remember { mutableStateOf(false) }
 
     var allItems by remember { mutableStateOf(listOf<VaultItem>()) }
     var selectedItems by remember { mutableStateOf(setOf<String>()) }
@@ -83,132 +100,136 @@ fun HomeScreen(userPin: String) {
     var searchQuery by remember { mutableStateOf("") }
 
     var thumbnailPaths by remember { mutableStateOf(mapOf<String, String>()) }
-    var processedThumbs by remember { mutableStateOf(0) }
-    var totalThumbs by remember { mutableStateOf(0) }
+    var mapMarkers by remember { mutableStateOf<List<MediaMeta>>(emptyList()) }
 
-    var gridColumns by remember { mutableIntStateOf(4) }
-    var sortOption by remember { mutableStateOf(SortOption.DATE_NEW) }
-    var showSortMenu by remember { mutableStateOf(false) }
+    var isFabExpanded by remember { mutableStateOf(false) }
+    var viewerStartIndex by remember { mutableStateOf<Int?>(null) }
+
+    // PROGRESS
+    var isSyncingThumbs by remember { mutableStateOf(false) }
+    var syncProgress by remember { mutableFloatStateOf(0f) }
+    var isImporting by remember { mutableStateOf(false) }
+
+    // SETTINGS STATE
+    var biometricEnabled by remember { mutableStateOf(vaultManager.isBiometricEnabled()) }
+    var screenshotBlocked by remember { mutableStateOf(vaultManager.isScreenshotBlockEnabled()) }
+
+    // APPLY SCREENSHOT BLOCKER REAL-TIME
+    LaunchedEffect(screenshotBlocked) {
+        if (screenshotBlocked) {
+            activity?.window?.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+    }
 
     // DIALOGS
     var showCreateAlbumDialog by remember { mutableStateOf(false) }
-    var showRenameDialog by remember { mutableStateOf<VaultItem?>(null) }
     var showMoveDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
-    var itemForMenu by remember { mutableStateOf<VaultItem?>(null) }
-    var showSettingsDialog by remember { mutableStateOf(false) }
-    var showPostExportDeleteDialog by remember { mutableStateOf<VaultItem?>(null) }
+    var showEmptyBinDialog by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
+    var showContextMenu by remember { mutableStateOf(false) }
+    val bottomSheetState = rememberModalBottomSheetState()
 
-    // LOADING
-    var isImporting by remember { mutableStateOf(false) }
-    var isProcessing by remember { mutableStateOf(false) }
-    var processingText by remember { mutableStateOf("") }
-    var aiProgress by remember { mutableStateOf("") }
-    var viewerStartIndex by remember { mutableStateOf<Int?>(null) }
-    var duplicateGroups by remember { mutableStateOf<Map<String, List<VaultItem>>?>(null) }
-
-    // --- SYSTEM DELETE HANDLER (FIXED) ---
-    val intentSenderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            Toast.makeText(context, "Originals Deleted", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    fun deleteOriginals(uris: List<Uri>) {
-        if (uris.isEmpty()) return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            try {
-                // Request system permission to delete
-                val pi = MediaStore.createDeleteRequest(context.contentResolver, uris)
-                intentSenderLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
-            } catch (e: Exception) {
-                e.printStackTrace()
-                Toast.makeText(context, "Could not launch delete dialog", Toast.LENGTH_SHORT).show()
-            }
-        } else {
-            // Android 10 and below
-            try {
-                var deletedCount = 0
-                uris.forEach { uri ->
-                    if(context.contentResolver.delete(uri, null, null) > 0) deletedCount++
-                }
-                Toast.makeText(context, "Deleted $deletedCount files", Toast.LENGTH_SHORT).show()
-            } catch (e: RecoverableSecurityException) {
-                // On Android 10, catch this to show system dialog
-                intentSenderLauncher.launch(IntentSenderRequest.Builder(e.userAction.actionIntent.intentSender).build())
-            }
-        }
-    }
-
-    // --- REFRESH LOGIC ---
     fun refresh() {
         scope.launch(Dispatchers.IO) {
-            indexManager.loadIndex(userPin)
-            val items = indexManager.index.items
-            withContext(Dispatchers.Main) { allItems = items }
-            thumbManager.syncThumbnails(userPin, items,
-                onProgress = { p, t -> processedThumbs = p; totalThumbs = t },
-                onUpdate = { map -> thumbnailPaths = map }
-            )
-        }
-    }
+            val items = fileManager.loadFiles(currentFolderId)
 
-    LaunchedEffect(Unit) {
-        refresh()
-        if (vaultManager.isAiEnabled()) {
-            withContext(Dispatchers.IO) {
-                val unscanned = indexManager.index.items.filter { it.type == ItemType.IMAGE && !it.isAiProcessed }
-                var count = 0
-                unscanned.forEach { item ->
-                    aiProgress = "AI: $count/${unscanned.size}"
-                    val file = crypto.decryptToCache(context, userPin, item.id, "jpg")
-                    if (file != null) {
-                        val bitmap = android.graphics.BitmapFactory.decodeFile(file.absolutePath)
-                        if (bitmap != null) {
-                            item.tags = aiScanner.scanImage(bitmap)
-                            item.isAiProcessed = true
-                            file.delete()
-                        }
+            withContext(Dispatchers.Main) {
+                allItems = items
+                thumbnailPaths = thumbManager.getThumbnailMap()
+            }
+
+            withContext(Dispatchers.Main) { isSyncingThumbs = true }
+            thumbManager.ensureThumbnails(userPin, items) { progress ->
+                syncProgress = progress
+                if (progress >= 1.0f) {
+                    val thumbs = thumbManager.getThumbnailMap()
+                    scope.launch(Dispatchers.Main) {
+                        thumbnailPaths = thumbs
+                        isSyncingThumbs = false
                     }
-                    count++
-                    if (count % 5 == 0) indexManager.saveIndex(userPin)
                 }
-                if (count > 0) indexManager.saveIndex(userPin)
-                aiProgress = ""
             }
+            val markers = metaManager.getMapMarkers()
+            withContext(Dispatchers.Main) { mapMarkers = markers }
         }
     }
 
-    fun scanDuplicates() {
-        isProcessing = true; processingText = "Scanning..."
-        scope.launch(Dispatchers.IO) {
-            val potential = allItems.filter { !it.isDeleted && it.type != ItemType.FOLDER }.groupBy { "${it.name}_${it.size}" }.filter { it.value.size > 1 }
-            val real = mutableMapOf<String, MutableList<VaultItem>>()
-            potential.values.forEach { group ->
-                val hashes = group.groupBy { crypto.calculateMD5(it.id) }
-                hashes.forEach { (h, i) -> if (i.size > 1 && h.isNotEmpty()) real[h] = i.toMutableList() }
-            }
-            withContext(Dispatchers.Main) { duplicateGroups = real; isProcessing = false }
-        }
-    }
+    LaunchedEffect(Unit) { refresh() }
 
-    fun getFolderName() = if (currentFolderId == null) "VaultX" else allItems.find { it.id == currentFolderId }?.name ?: "Folder"
-
-    // --- NAVIGATION BACK HANDLER ---
     BackHandler {
         when {
+            showContextMenu -> { showContextMenu = false; isSelectionMode = false; selectedItems = emptySet() }
             isSelectionMode -> { isSelectionMode = false; selectedItems = emptySet() }
-            currentScreen == Screen.AI_FILTER -> { aiFilterTag = null; currentScreen = Screen.HOME }
+            isFabExpanded -> isFabExpanded = false
             currentScreen != Screen.HOME -> currentScreen = Screen.HOME
-            currentFolderId != null -> currentFolderId = allItems.find { it.id == currentFolderId }?.parentId
-            searchQuery.isNotEmpty() -> searchQuery = ""
+            currentFolderId != null -> { currentFolderId = null; refresh() }
             else -> (context as? Activity)?.finish()
         }
     }
 
-    if (currentScreen == Screen.BROWSER) {
-        BrowserScreen(userPin) { currentScreen = Screen.HOME; refresh() }
-        return
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) {
+            if (isImporting) { Toast.makeText(context, "Importing...", Toast.LENGTH_SHORT).show(); return@rememberLauncherForActivityResult }
+            isImporting = true; isFabExpanded = false
+
+            scope.launch(Dispatchers.IO) {
+                try {
+                    uris.forEach { try { context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch(_:Exception){} }
+                    val cacheFile = File(context.cacheDir, "import_queue.txt")
+                    cacheFile.writeText(uris.joinToString("\n") { it.toString() })
+                    val request = OneTimeWorkRequestBuilder<FileWorker>().setInputData(workDataOf("ACTION" to "IMPORT", "PIN" to userPin, "URI_LIST_FILE" to cacheFile.absolutePath, "PARENT_ID" to currentFolderId)).build()
+                    workManager.enqueue(request)
+                    withContext(Dispatchers.Main) {
+                        launch {
+                            workManager.getWorkInfoByIdFlow(request.id).collect {
+                                if (it?.state?.isFinished == true) {
+                                    isImporting = false; refresh(); Toast.makeText(context, "Done", Toast.LENGTH_SHORT).show()
+                                    this.cancel()
+                                }
+                            }
+                        }
+                    }
+                } catch(e: Exception) { withContext(Dispatchers.Main) { isImporting = false } }
+            }
+        }
+    }
+
+    fun shareSelectedItems() {
+        scope.launch(Dispatchers.IO) {
+            val files = allItems.filter { selectedItems.contains(it.id) && it.type != ItemType.FOLDER }
+            val uris = ArrayList<Uri>()
+            val cacheDir = File(context.cacheDir, "shared").apply { mkdirs() }
+            files.forEach { item ->
+                val dest = File(cacheDir, item.name)
+                if (crypto.decryptToStream(userPin, File(item.path), FileOutputStream(dest))) uris.add(FileProvider.getUriForFile(context, "${context.packageName}.provider", dest))
+            }
+            if (uris.isNotEmpty()) {
+                val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply { type = "*/*"; putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                withContext(Dispatchers.Main) { context.startActivity(Intent.createChooser(intent, "Share")); showContextMenu = false; isSelectionMode = false; selectedItems = emptySet() }
+            }
+        }
+    }
+
+    val displayItems = remember(allItems, searchQuery, currentScreen, currentFolderId) {
+        var list = if (currentScreen == Screen.RECYCLE_BIN) allItems.filter { it.isDeleted } else allItems.filter { !it.isDeleted }
+        if (searchQuery.isNotEmpty()) list = list.filter { it.name.contains(searchQuery, true) }
+        list
+    }
+
+    val groupedItems = remember(displayItems, showDates) {
+        if (!showDates) mapOf("All" to displayItems)
+        else displayItems.groupBy {
+            if(it.type == ItemType.FOLDER) "Albums"
+            else {
+                val date = Date(it.dateModified)
+                val today = Date()
+                val sdf = SimpleDateFormat("MMMM dd, yyyy", Locale.getDefault())
+                if (sdf.format(date) == sdf.format(today)) "Today" else sdf.format(date)
+            }
+        }
     }
 
     ModalNavigationDrawer(
@@ -216,377 +237,220 @@ fun HomeScreen(userPin: String) {
         drawerContent = {
             ModalDrawerSheet {
                 Spacer(Modifier.height(32.dp))
-                // LOGO IN DRAWER TOO
                 Image(painter = painterResource(id = R.drawable.vaultx), contentDescription = null, modifier = Modifier.padding(16.dp).size(64.dp))
-                Text("VaultX", modifier = Modifier.padding(start = 16.dp, bottom = 16.dp), fontWeight = FontWeight.Bold, fontSize = 24.sp)
+                Text("VaultX", modifier = Modifier.padding(start = 16.dp, bottom = 16.dp), color = VioletAccent, fontWeight = FontWeight.Bold, fontSize = 24.sp)
                 HorizontalDivider()
-                NavigationDrawerItem(label = { Text("Home") }, selected = currentScreen == Screen.HOME, onClick = { currentScreen = Screen.HOME; scope.launch { drawerState.close() } }, icon = { Icon(Icons.Default.Home, null) })
-                NavigationDrawerItem(label = { Text("Recycle Bin") }, selected = currentScreen == Screen.RECYCLE_BIN, onClick = { currentScreen = Screen.RECYCLE_BIN; scope.launch { drawerState.close() } }, icon = { Icon(Icons.Default.Delete, null) })
-                NavigationDrawerItem(label = { Text("Private Browser") }, selected = currentScreen == Screen.BROWSER, onClick = { currentScreen = Screen.BROWSER; scope.launch { drawerState.close() } }, icon = { Icon(Icons.Default.Search, null) })
-                NavigationDrawerItem(label = { Text("Duplicate Finder") }, selected = currentScreen == Screen.DUPLICATES, onClick = { currentScreen = Screen.DUPLICATES; scanDuplicates(); scope.launch { drawerState.close() } }, icon = { Icon(Icons.Default.List, null) })
-                NavigationDrawerItem(label = { Text("Settings") }, selected = currentScreen == Screen.SETTINGS, onClick = { currentScreen = Screen.SETTINGS; scope.launch { drawerState.close() } }, icon = { Icon(Icons.Default.Settings, null) })
+                NavigationDrawerItem(label = { Text("Media") }, selected = currentScreen == Screen.HOME, onClick = { currentScreen = Screen.HOME; scope.launch { drawerState.close() } }, icon = { Icon(Icons.Rounded.PhotoLibrary, null) })
+                NavigationDrawerItem(label = { Text("Recycle Bin") }, selected = currentScreen == Screen.RECYCLE_BIN, onClick = { currentScreen = Screen.RECYCLE_BIN; scope.launch { drawerState.close() } }, icon = { Icon(Icons.Rounded.Delete, null) })
+
+                // BIOMETRIC
+                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                    Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Rounded.Fingerprint, null, tint = Color.Gray); Spacer(Modifier.width(12.dp)); Text("Biometric Unlock", fontWeight = FontWeight.Medium) }
+                    Switch(checked = biometricEnabled, onCheckedChange = { biometricEnabled = it; vaultManager.setBiometricEnabled(it) })
+                }
+
+                // SCREENSHOT BLOCKER (NEW)
+                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                    Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Rounded.VisibilityOff, null, tint = Color.Gray); Spacer(Modifier.width(12.dp)); Text("Block Screenshots", fontWeight = FontWeight.Medium) }
+                    Switch(checked = screenshotBlocked, onCheckedChange = { screenshotBlocked = it; vaultManager.setScreenshotBlockEnabled(it) })
+                }
+
+                NavigationDrawerItem(label = { Text("About") }, selected = false, onClick = { showAboutDialog = true; scope.launch { drawerState.close() } }, icon = { Icon(Icons.Rounded.Info, null) })
             }
         }
     ) {
         Scaffold(
-            modifier = Modifier.background(Color.Black).statusBarsPadding(),
+            containerColor = PitchBlack,
             topBar = {
-                Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
-                    Row(
-                        Modifier.padding(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        if (isSelectionMode) {
-                            IconButton(onClick = { isSelectionMode = false; selectedItems = emptySet() }) { Icon(Icons.Default.Close, "Close") }
-                            Text("${selectedItems.size}", fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.weight(1f))
-
-                            // SELECTION MENU (Right Side)
-                            IconButton(onClick = {
-                                selectedItems = if(selectedItems.size == allItems.filter { it.parentId == currentFolderId }.size) emptySet() else allItems.filter { it.parentId == currentFolderId }.map { it.id }.toSet()
-                            }) { Icon(Icons.Default.SelectAll, "All") }
-
-                            // ACTIONS ROW
-                            Row {
-                                if (currentScreen == Screen.RECYCLE_BIN) {
-                                    IconButton(onClick = { allItems.filter { selectedItems.contains(it.id) }.forEach { it.isDeleted = false }; indexManager.saveIndex(userPin); refresh(); isSelectionMode = false }) { Icon(Icons.Default.Restore, "Restore") }
-                                    IconButton(onClick = { showDeleteDialog = true }) { Icon(Icons.Default.DeleteForever, "Delete", tint = Color.Red) }
-                                } else {
-                                    IconButton(onClick = { showMoveDialog = true }) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "Move") }
-                                    IconButton(onClick = {
-                                        // Share Logic
-                                        isProcessing = true
-                                        scope.launch(Dispatchers.IO) {
-                                            val files = allItems.filter { selectedItems.contains(it.id) }.mapNotNull { item ->
-                                                crypto.decryptToCache(context, userPin, item.id, item.name.substringAfterLast('.', "dat"))
-                                            }
-                                            if (files.isNotEmpty()) {
-                                                val uris = files.map { FileProvider.getUriForFile(context, "${context.packageName}.provider", it) }
-                                                val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-                                                    type = "*/*"
-                                                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
-                                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                }
-                                                context.startActivity(Intent.createChooser(intent, "Share"))
-                                            }
-                                            withContext(Dispatchers.Main) { isProcessing = false; isSelectionMode = false }
-                                        }
-                                    }) { Icon(Icons.Default.Share, "Share") }
-
-                                    IconButton(onClick = {
-                                        // EXPORT
-                                        isProcessing = true
-                                        scope.launch(Dispatchers.IO) {
-                                            val downDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
-                                            allItems.filter { selectedItems.contains(it.id) }.forEach { item ->
-                                                val dest = File(downDir, item.name)
-                                                crypto.decryptToStream(userPin, item.id, FileOutputStream(dest))
-                                            }
-                                            withContext(Dispatchers.Main) {
-                                                isProcessing = false
-                                                showPostExportDeleteDialog = allItems.find { it.id == selectedItems.first() } // Trigger delete prompt for batch
-                                                isSelectionMode = false
-                                            }
-                                        }
-                                    }) { Icon(Icons.Default.Output, "Export") } // Using Output for Export
-
-                                    IconButton(onClick = {
-                                        allItems.filter { selectedItems.contains(it.id) }.forEach { it.isDeleted = true; it.deletedTimestamp = System.currentTimeMillis() }
-                                        indexManager.saveIndex(userPin); refresh(); isSelectionMode = false
-                                    }) { Icon(Icons.Default.Delete, "Delete") }
-                                }
-                            }
+                Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars).padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (isSelectionMode) {
+                        IconButton(onClick = { isSelectionMode = false; selectedItems = emptySet() }) { Icon(Icons.Default.Close, null, tint = TextWhite) }
+                        Text("${selectedItems.size}", color = TextWhite, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        if (currentScreen == Screen.RECYCLE_BIN) {
+                            IconButton(onClick = { scope.launch { fileManager.restoreFromTrash(displayItems.filter { selectedItems.contains(it.id) }); refresh(); isSelectionMode = false } }) { Icon(Icons.Default.Restore, null, tint = TextWhite) }
+                            IconButton(onClick = { showDeleteDialog = true }) { Icon(Icons.Default.DeleteForever, null, tint = WarningRed) }
                         } else {
-                            if (currentFolderId != null && currentScreen == Screen.HOME) {
-                                IconButton(onClick = { currentFolderId = allItems.find { it.id == currentFolderId }?.parentId }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-                            } else {
-                                IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, "Menu") }
-                            }
+                            IconButton(onClick = { showDeleteDialog = true }) { Icon(Icons.Default.Delete, null, tint = WarningRed) }
+                        }
+                    } else {
+                        if (currentFolderId != null) IconButton(onClick = { currentFolderId = allItems.find { it.id == currentFolderId }?.parentId; refresh() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = TextWhite) }
+                        else Image(painter = painterResource(id = R.drawable.vaultx), contentDescription = null, modifier = Modifier.size(32.dp))
 
-                            if (currentScreen == Screen.HOME && aiFilterTag == null) {
-                                Box(
-                                    Modifier.weight(1f).height(40.dp).clip(RoundedCornerShape(50)).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 12.dp),
-                                    contentAlignment = Alignment.CenterStart
-                                ) {
-                                    if (searchQuery.isEmpty()) Text("Search...", color = Color.Gray, fontSize = 14.sp)
-                                    BasicTextField(
-                                        value = searchQuery,
-                                        onValueChange = { searchQuery = it },
-                                        singleLine = true,
-                                        textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp),
-                                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
-                                }
-                            } else {
-                                Text(when(currentScreen){ Screen.RECYCLE_BIN -> "Trash"; Screen.DUPLICATES -> "Duplicates"; Screen.AI_FILTER -> "AI: $aiFilterTag"; else -> "Settings" }, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        Spacer(Modifier.width(16.dp))
+                        Box(Modifier.weight(1f).height(32.dp).clip(RoundedCornerShape(50)).background(DarkGray), contentAlignment = Alignment.CenterStart) {
+                            BasicTextField(value = searchQuery, onValueChange = { searchQuery = it }, textStyle = TextStyle(color = TextWhite, fontSize = 14.sp), cursorBrush = SolidColor(VioletAccent), singleLine = true, decorationBox = { inner -> if(searchQuery.isEmpty()) Text("Search", color = Color.Gray, fontSize = 12.sp); inner() }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
+                        }
+
+                        Box {
+                            IconButton(onClick = { showViewMenu = true }) { Icon(Icons.Rounded.Visibility, null, tint = TextWhite) }
+                            DropdownMenu(expanded = showViewMenu, onDismissRequest = { showViewMenu = false }) {
+                                DropdownMenuItem(text = { Text("List View", color = TextWhite) }, onClick = { viewMode = ViewMode.LIST; showViewMenu = false }, leadingIcon = { Icon(Icons.AutoMirrored.Filled.List, null, tint = VioletAccent) })
+                                DropdownMenuItem(text = { Text("Grid View (4)", color = TextWhite) }, onClick = { viewMode = ViewMode.GRID; showViewMenu = false }, leadingIcon = { Icon(Icons.Rounded.GridView, null, tint = VioletAccent) })
+                                DropdownMenuItem(text = { Text("Tiny View (7)", color = TextWhite) }, onClick = { viewMode = ViewMode.TINY; showViewMenu = false }, leadingIcon = { Icon(Icons.Rounded.Apps, null, tint = VioletAccent) })
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = { Row(verticalAlignment = Alignment.CenterVertically) { Text("Show Dates", color = TextWhite, modifier = Modifier.weight(1f)); Switch(checked = showDates, onCheckedChange = null) } },
+                                    onClick = { showDates = !showDates }
+                                )
                             }
                         }
 
-                        if (currentScreen == Screen.HOME && !isSelectionMode && aiFilterTag == null) {
-                            Box {
-                                IconButton(onClick = { showSortMenu = true }) { Icon(Icons.AutoMirrored.Filled.Sort, "Sort") }
-                                DropdownMenu(expanded = showSortMenu, onDismissRequest = { showSortMenu = false }) { SortOption.values().forEach { o -> DropdownMenuItem(text = { Text(o.name) }, onClick = { sortOption = o; showSortMenu = false }) } }
-                            }
-                            // IMPORT
-                            val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-                                if (uris.isNotEmpty()) {
-                                    isImporting = true
-                                    scope.launch(Dispatchers.IO) {
-                                        uris.forEach { uri ->
-                                            try {
-                                                val meta = getFileMetadata(context, uri)
-                                                val newItem = VaultItem(name = meta.first, type = detectMimeType(context, uri), parentId = currentFolderId, size = meta.second)
-                                                context.contentResolver.openInputStream(uri)?.use { crypto.encryptData(userPin, it, newItem.id) {} }
-                                                withContext(Dispatchers.Main) { indexManager.addFile(newItem) }
-                                            } catch (e: Exception) {}
-                                        }
-                                        withContext(Dispatchers.Main) {
-                                            indexManager.saveIndex(userPin)
-                                            isImporting = false
-                                            refresh()
-                                            // TRIGGER SYSTEM DELETE PROMPT
-                                            deleteOriginals(uris)
-                                        }
-                                    }
-                                }
-                            }
-                            Spacer(Modifier.width(4.dp))
-                            FilledIconButton(onClick = { launcher.launch(arrayOf("*/*")) }, colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primary)) { Icon(Icons.Default.Add, "Import") }
+                        if (currentScreen == Screen.RECYCLE_BIN) {
+                            IconButton(onClick = { showEmptyBinDialog = true }) { Icon(Icons.Rounded.DeleteSweep, null, tint = WarningRed) }
+                        } else {
+                            IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Rounded.Menu, null, tint = TextWhite) }
                         }
                     }
                 }
             },
             floatingActionButton = {
-                AnimatedVisibility(visible = !isSelectionMode && currentScreen == Screen.HOME && aiFilterTag == null, enter = fadeIn(), exit = fadeOut()) {
-                    FloatingActionButton(onClick = { showCreateAlbumDialog = true }, shape = CircleShape, containerColor = MaterialTheme.colorScheme.secondary) { Icon(Icons.Default.CreateNewFolder, "New Album") }
+                if (currentScreen == Screen.HOME && !isSelectionMode) {
+                    Column(horizontalAlignment = Alignment.End) {
+                        AnimatedVisibility(visible = isFabExpanded) {
+                            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) { Text("New Album", color = TextWhite, fontSize = 12.sp, modifier = Modifier.padding(end = 8.dp).background(Color.Black.copy(0.7f), RoundedCornerShape(4.dp)).padding(4.dp)); FloatingActionButton(onClick = { showCreateAlbumDialog = true; isFabExpanded = false }, containerColor = VioletAccent, shape = CircleShape, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.CreateNewFolder, "Album", tint = Color.White) } }
+                                Row(verticalAlignment = Alignment.CenterVertically) { Text("Import", color = TextWhite, fontSize = 12.sp, modifier = Modifier.padding(end = 8.dp).background(Color.Black.copy(0.7f), RoundedCornerShape(4.dp)).padding(4.dp)); FloatingActionButton(onClick = { if(!isImporting) launcher.launch(arrayOf("*/*")) }, containerColor = if(isImporting) Color.Gray else VioletAccent, shape = CircleShape, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.AddPhotoAlternate, "Import", tint = Color.White) } }
+                                Spacer(Modifier.height(8.dp))
+                            }
+                        }
+                        FloatingActionButton(onClick = { isFabExpanded = !isFabExpanded }, containerColor = VioletAccent, shape = RoundedCornerShape(16.dp)) { Icon(Icons.Default.Add, null, tint = TextWhite, modifier = Modifier.rotate(if (isFabExpanded) 45f else 0f)) }
+                    }
                 }
             }
         ) { padding ->
-            // GESTURE DETECTOR FOR GRID RESIZING
-            Box(Modifier.padding(padding).fillMaxSize().background(MaterialTheme.colorScheme.background)
+            Box(Modifier.padding(padding).fillMaxSize().background(PitchBlack)
                 .pointerInput(Unit) {
                     detectTransformGestures { _, _, zoom, _ ->
-                        if (zoom > 1.2f) gridColumns = 3 // Zoom In -> Fewer cols
-                        else if (zoom < 0.8f) gridColumns = 7 // Zoom Out -> More cols
-                        else if (zoom > 0.9f && zoom < 1.1f) gridColumns = 4 // Reset
+                        if (zoom > 1.2f && viewMode == ViewMode.TINY) viewMode = ViewMode.GRID
+                        else if (zoom < 0.8f && viewMode == ViewMode.GRID) viewMode = ViewMode.TINY
                     }
                 }
             ) {
-                Column {
-                    Box(Modifier.weight(1f)) {
-                        when(currentScreen) {
-                            Screen.HOME, Screen.AI_FILTER -> {
-                                var displayItems = allItems.filter { !it.isDeleted }
-                                if (currentScreen == Screen.AI_FILTER && aiFilterTag != null) {
-                                    displayItems = displayItems.filter { it.tags.any { tag -> tag.contains(aiFilterTag!!, ignoreCase = true) } }
-                                } else {
-                                    displayItems = displayItems.filter { it.parentId == currentFolderId }
-                                        .filter { searchQuery.isEmpty() || it.name.contains(searchQuery, true) || it.tags.any { t -> t.contains(searchQuery, true) } }
-                                }
-                                displayItems = displayItems.sortedWith(when(sortOption) {
-                                    SortOption.DATE_NEW -> compareByDescending { it.dateModified }
-                                    SortOption.DATE_OLD -> compareBy { it.dateModified }
-                                    SortOption.NAME_AZ -> compareBy { it.name }
-                                    SortOption.NAME_ZA -> compareByDescending { it.name }
-                                })
+                if (currentScreen == Screen.HOME) {
+                    val cols = when(viewMode) {
+                        ViewMode.LIST -> 1
+                        ViewMode.GRID -> 4
+                        ViewMode.TINY -> 7
+                    }
 
-                                Column {
-                                    VaultGrid(displayItems, allItems, thumbnailPaths, selectedItems, isSelectionMode, gridColumns,
-                                        onItemClick = { item ->
-                                            if (isSelectionMode) selectedItems = if (selectedItems.contains(item.id)) selectedItems - item.id else selectedItems + item.id
-                                            else {
-                                                if (item.type == ItemType.FOLDER) currentFolderId = item.id
-                                                else {
-                                                    // HANDLE EXTERNAL OPENING
-                                                    if (item.type == ItemType.PDF || item.type == ItemType.AUDIO) {
-                                                        scope.launch(Dispatchers.IO) {
-                                                            val ext = item.name.substringAfterLast('.', "dat")
-                                                            val file = crypto.decryptToCache(context, userPin, item.id, ext)
-                                                            if (file != null) {
-                                                                val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
-                                                                val intent = Intent(Intent.ACTION_VIEW).apply {
-                                                                    val mime = if (item.type == ItemType.PDF) "application/pdf" else "audio/*"
-                                                                    setDataAndType(uri, mime)
-                                                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                                }
-                                                                try { context.startActivity(intent) } catch(e: Exception) {
-                                                                    withContext(Dispatchers.Main){ Toast.makeText(context, "No app found", Toast.LENGTH_SHORT).show() }
-                                                                }
-                                                            }
-                                                        }
-                                                    } else {
-                                                        viewerStartIndex = displayItems.indexOf(item)
-                                                    }
-                                                }
-                                            }
+                    LazyVerticalGrid(columns = GridCells.Fixed(cols), contentPadding = PaddingValues(8.dp, 8.dp, 8.dp, 100.dp), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        groupedItems.forEach { (header, items) ->
+                            if (showDates) {
+                                item(span = { GridItemSpan(cols) }) { Text(header, color = TextWhite, fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 8.dp)) }
+                            }
+                            items(items, key = { it.id }) { item ->
+                                if (viewMode == ViewMode.LIST) {
+                                    ListGridItem(item, thumbnailPaths[item.id], selectedItems.contains(item.id),
+                                        onClick = {
+                                            if (isSelectionMode) selectedItems = if(selectedItems.contains(item.id)) selectedItems - item.id else selectedItems + item.id
+                                            else { if (item.type == ItemType.FOLDER) { currentFolderId = item.name; refresh() } else viewerStartIndex = displayItems.indexOf(item) }
                                         },
-                                        onLongClick = { selectedItems = setOf(it.id); isSelectionMode = true }
+                                        onLongClick = { if (!isSelectionMode) { selectedItems = setOf(item.id); isSelectionMode = true; showContextMenu = true } }
                                     )
-
-                                    if (currentScreen == Screen.HOME && currentFolderId == null && !isSelectionMode) {
-                                        Text("AI Tools", Modifier.padding(start = 16.dp, top = 8.dp), fontWeight = FontWeight.Bold, color = Color.Gray)
-                                        Row(Modifier.horizontalScroll(rememberScrollState()).padding(8.dp)) {
-                                            AiToolCard("Selfies", Icons.Default.Face) { aiFilterTag = "Selfie"; currentScreen = Screen.AI_FILTER }
-                                            AiToolCard("Docs", Icons.Default.Info) { aiFilterTag = "Text"; currentScreen = Screen.AI_FILTER }
-                                            AiToolCard("Places", Icons.Default.LocationOn) { aiFilterTag = "Landmark"; currentScreen = Screen.AI_FILTER }
-                                            AiToolCard("Duplicates", Icons.Default.List) { currentScreen = Screen.DUPLICATES; scanDuplicates() }
-                                        }
-                                    }
+                                } else {
+                                    GlassGridItem(item, thumbnailPaths[item.id], selectedItems.contains(item.id),
+                                        onClick = {
+                                            if (isSelectionMode) selectedItems = if(selectedItems.contains(item.id)) selectedItems - item.id else selectedItems + item.id
+                                            else { if (item.type == ItemType.FOLDER) { currentFolderId = item.name; refresh() } else viewerStartIndex = displayItems.indexOf(item) }
+                                        },
+                                        onLongClick = { if (!isSelectionMode) { selectedItems = setOf(item.id); isSelectionMode = true; showContextMenu = true } }
+                                    )
                                 }
-                            }
-
-                            Screen.RECYCLE_BIN -> {
-                                val deleted = allItems.filter { it.isDeleted }
-                                if (deleted.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Trash Empty") }
-                                else VaultGrid(deleted, allItems, thumbnailPaths, selectedItems, isSelectionMode, gridColumns, { if(isSelectionMode) selectedItems = if (selectedItems.contains(it.id)) selectedItems - it.id else selectedItems + it.id }, { selectedItems = setOf(it.id); isSelectionMode = true })
-                            }
-
-                            Screen.DUPLICATES -> {
-                                if (isProcessing) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-                                else {
-                                    Column {
-                                        Button(onClick = { scanDuplicates() }, modifier = Modifier.align(Alignment.CenterHorizontally).padding(8.dp)) { Text("Start Scan") }
-                                        if (duplicateGroups.isNullOrEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No Duplicates Found") }
-                                        else {
-                                            LazyVerticalGrid(columns = GridCells.Fixed(1)) {
-                                                duplicateGroups!!.forEach { (_, items) ->
-                                                    item {
-                                                        Card(Modifier.padding(8.dp).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-                                                            Column(Modifier.padding(12.dp)) {
-                                                                Text("Duplicate Group (${items.size})", fontWeight = FontWeight.Bold)
-                                                                Row(Modifier.horizontalScroll(rememberScrollState())) {
-                                                                    items.forEach { item ->
-                                                                        val thumb = thumbnailPaths[item.id]?.let { File(it) }
-                                                                        if(thumb != null) AsyncImage(model = thumb, contentDescription = null, modifier = Modifier.size(60.dp).clip(RoundedCornerShape(8.dp)).border(1.dp, Color.Gray, RoundedCornerShape(8.dp)), contentScale = ContentScale.Crop)
-                                                                        Spacer(Modifier.width(4.dp))
-                                                                    }
-                                                                }
-                                                                Button(onClick = { items.drop(1).forEach { it.isDeleted = true }; indexManager.saveIndex(userPin); refresh(); scanDuplicates() }, modifier = Modifier.align(Alignment.End)) { Text("Keep Best") }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Screen.SETTINGS -> {
-                                Column(Modifier.padding(16.dp)) {
-                                    var isBio by remember { mutableStateOf(vaultManager.isBiometricEnabled()) }
-                                    var isAi by remember { mutableStateOf(vaultManager.isAiEnabled()) }
-                                    val aiStats = allItems.count { it.type == ItemType.IMAGE && it.isAiProcessed }
-                                    Row(verticalAlignment = Alignment.CenterVertically) { Text("Biometric Unlock", Modifier.weight(1f)); Switch(isBio, { isBio = it; vaultManager.setBiometricEnabled(it) }) }
-                                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Column(Modifier.weight(1f)) {
-                                            Text("AI Search");
-                                            Text("Processed: $aiStats", fontSize = 10.sp, color = Color.Gray)
-                                        }
-                                        Switch(isAi, { isAi = it; vaultManager.setAiEnabled(it) })
-                                    }
-                                }
-                            }
-                            else -> {}
-                        }
-                    }
-
-                    if ((processedThumbs < totalThumbs) || aiProgress.isNotEmpty()) {
-                        Surface(color = Color.Black.copy(0.9f), contentColor = Color.White) {
-                            Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.Center) {
-                                if (processedThumbs < totalThumbs) Text("Syncing: $processedThumbs/$totalThumbs", fontSize = 12.sp)
-                                if (processedThumbs < totalThumbs && aiProgress.isNotEmpty()) Spacer(Modifier.width(16.dp))
-                                if (aiProgress.isNotEmpty()) Text(aiProgress, fontSize = 12.sp)
                             }
                         }
                     }
+                } else if (currentScreen == Screen.RECYCLE_BIN) {
+                    val deleted = allItems.filter { it.isDeleted }
+                    if (deleted.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Empty", color = Color.Gray) }
+                    else VaultGrid(deleted, thumbnailPaths, selectedItems, isSelectionMode, 4, { if(isSelectionMode) selectedItems = if (selectedItems.contains(it.id)) selectedItems - it.id else selectedItems + it.id }, { selectedItems = setOf(it.id); isSelectionMode = true })
+                } else if (currentScreen == Screen.MAP_VIEW) {
+                    AndroidView(factory = { ctx -> Configuration.getInstance().userAgentValue = "VaultX"; MapView(ctx).apply { setTileSource(TileSourceFactory.MAPNIK); setMultiTouchControls(true); controller.setZoom(4.0); mapMarkers.forEach { m -> if (m.lat != null && m.lon != null) { val marker = Marker(this); marker.position = GeoPoint(m.lat, m.lon); overlays.add(marker) } } } }, modifier = Modifier.fillMaxSize())
                 }
 
-                if (isImporting || (isProcessing && currentScreen != Screen.DUPLICATES)) Box(Modifier.fillMaxSize().background(Color.Black.copy(0.5f)), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                Column(modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (isSyncingThumbs && syncProgress < 1.0f) CuteProgressIndicator(text = "Syncing: ${(syncProgress * 100).toInt()}%", progress = syncProgress)
+                    if (isImporting) CuteProgressIndicator(text = "Importing Files...", indeterminate = true)
+                }
+            }
+        }
+    }
+
+    if (showContextMenu) {
+        ModalBottomSheet(onDismissRequest = { showContextMenu = false }, sheetState = bottomSheetState, containerColor = DarkGray) {
+            Column(Modifier.padding(bottom = 24.dp)) {
+                Text("${selectedItems.size} Selected", color = TextWhite, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp))
+                HorizontalDivider(color = Color.Gray.copy(alpha = 0.5f))
+                ContextMenuItem(icon = Icons.Rounded.SelectAll, text = "Select All") { selectedItems = displayItems.map { it.id }.toSet(); scope.launch { bottomSheetState.hide() }.invokeOnCompletion { showContextMenu = false } }
+                ContextMenuItem(icon = Icons.Rounded.Delete, text = "Delete", tint = WarningRed) { showDeleteDialog = true; scope.launch { bottomSheetState.hide() }.invokeOnCompletion { showContextMenu = false } }
+                ContextMenuItem(icon = Icons.Rounded.DriveFileMove, text = "Move to Folder") { showMoveDialog = true; scope.launch { bottomSheetState.hide() }.invokeOnCompletion { showContextMenu = false } }
+                ContextMenuItem(icon = Icons.Rounded.Output, text = "Export") { val ids = selectedItems.toTypedArray(); val work = OneTimeWorkRequestBuilder<FileWorker>().setInputData(workDataOf("ACTION" to "EXPORT", "PIN" to userPin, "IDS" to ids)).build(); WorkManager.getInstance(context).enqueue(work); Toast.makeText(context, "Exporting...", Toast.LENGTH_SHORT).show(); isSelectionMode = false; selectedItems = emptySet(); scope.launch { bottomSheetState.hide() }.invokeOnCompletion { showContextMenu = false } }
+                ContextMenuItem(icon = Icons.Rounded.Share, text = "Share") { shareSelectedItems(); scope.launch { bottomSheetState.hide() }.invokeOnCompletion { showContextMenu = false } }
             }
         }
     }
 
     if (viewerStartIndex != null) {
-        val viewList = allItems.filter { !it.isDeleted && (if(currentScreen == Screen.HOME) it.parentId == currentFolderId else true) }
+        val viewList = displayItems.filter { it.type != ItemType.FOLDER }
         MediaViewer(viewerStartIndex!!, viewList, userPin) { viewerStartIndex = null }
     }
 
-    // ... [Standard Dialogs: Create, Rename, Move, PostExportDelete - Include logic from previous steps] ...
-    if (showCreateAlbumDialog) { var name by remember { mutableStateOf("") }; AlertDialog(onDismissRequest = { showCreateAlbumDialog = false }, title = { Text("New Album") }, text = { OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") }) }, confirmButton = { Button(onClick = { if (name.isNotEmpty()) { indexManager.createFolder(name, currentFolderId); indexManager.saveIndex(userPin); refresh(); showCreateAlbumDialog = false } }) { Text("Create") } }) }
-    if (showDeleteDialog) { AlertDialog(onDismissRequest = { showDeleteDialog = false }, title = { Text("Delete Forever?") }, confirmButton = { Button(onClick = { val nuke = allItems.filter { selectedItems.contains(it.id) }; indexManager.deleteItems(nuke, userPin); refresh(); isSelectionMode = false; showDeleteDialog = false }, colors = ButtonDefaults.buttonColors(containerColor = Color.Red)) { Text("Delete") } }, dismissButton = { TextButton(onClick = { showDeleteDialog = false }) { Text("Cancel") } }) }
-    if (showRenameDialog != null) { var name by remember { mutableStateOf(showRenameDialog!!.name) }; AlertDialog(onDismissRequest = { showRenameDialog = null }, title = { Text("Rename") }, text = { OutlinedTextField(value = name, onValueChange = { name = it }) }, confirmButton = { Button(onClick = { indexManager.renameItem(showRenameDialog!!, name, userPin); refresh(); isSelectionMode = false; selectedItems = emptySet(); showRenameDialog = null }) { Text("Save") } }) }
-    if (showMoveDialog) { val folders = allItems.filter { it.type == ItemType.FOLDER && !selectedItems.contains(it.id) }; AlertDialog(onDismissRequest = { showMoveDialog = false }, title = { Text("Move to...") }, text = { Column { if (currentFolderId != null) TextButton(onClick = { indexManager.moveItems(allItems.filter { selectedItems.contains(it.id) }, null, userPin); refresh(); showMoveDialog = false; isSelectionMode = false }) { Text("Root") }; folders.forEach { f -> TextButton(onClick = { indexManager.moveItems(allItems.filter { selectedItems.contains(it.id) }, f.id, userPin); refresh(); showMoveDialog = false; isSelectionMode = false }) { Text(f.name) } } } }, confirmButton = { TextButton(onClick = { showMoveDialog = false }) { Text("Cancel") } }) }
-    if (showPostExportDeleteDialog != null) { AlertDialog(onDismissRequest = { showPostExportDeleteDialog = null }, title = { Text("Exported") }, text = { Text("Delete from Vault?") }, confirmButton = { Button(onClick = { indexManager.deleteItems(listOf(showPostExportDeleteDialog!!), userPin); showPostExportDeleteDialog = null; refresh() }, colors = ButtonDefaults.buttonColors(containerColor = Color.Red)) { Text("Delete") } }, dismissButton = { TextButton(onClick = { showPostExportDeleteDialog = null }) { Text("Keep") } }) }
+    // ... Dialogs, ListGridItem, GlassGridItem, VaultGrid (Same as previous) ...
+    if (showCreateAlbumDialog) { var name by remember { mutableStateOf("") }; AlertDialog(onDismissRequest = { showCreateAlbumDialog = false }, title = { Text("New Album") }, text = { OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") }) }, confirmButton = { Button(onClick = { if (name.isNotEmpty()) { fileManager.createFolder(name, currentFolderId); refresh(); showCreateAlbumDialog = false } }) { Text("Create") } }) }
+    if (showDeleteDialog) { AlertDialog(onDismissRequest = { showDeleteDialog = false }, title = { Text("Delete Forever?") }, confirmButton = { Button(onClick = { scope.launch { val nuke = displayItems.filter { selectedItems.contains(it.id) }; if(currentScreen==Screen.RECYCLE_BIN) fileManager.deletePermanently(nuke) else fileManager.moveToTrash(nuke); refresh(); isSelectionMode = false; showDeleteDialog = false } }, colors = ButtonDefaults.buttonColors(containerColor = Color.Red)) { Text("Delete") } }, dismissButton = { TextButton(onClick = { showDeleteDialog = false }) { Text("Cancel") } }) }
+    if (showEmptyBinDialog) { AlertDialog(onDismissRequest = { showEmptyBinDialog = false }, title = { Text("Empty Bin?") }, text = { Text("Permanently delete all items in trash?") }, confirmButton = { Button(onClick = { scope.launch { val nuke = allItems.filter { it.isDeleted }; fileManager.deletePermanently(nuke); refresh(); showEmptyBinDialog = false } }, colors = ButtonDefaults.buttonColors(containerColor = Color.Red)) { Text("Empty") } }, dismissButton = { TextButton(onClick = { showEmptyBinDialog = false }) { Text("Cancel") } }) }
+    if (showMoveDialog) { val folders = allItems.filter { it.type == ItemType.FOLDER && !selectedItems.contains(it.id) }; AlertDialog(onDismissRequest = { showMoveDialog = false }, title = { Text("Move to Folder") }, text = { LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) { item { ListItem(headlineContent = { Text("Root Folder") }, leadingContent = { Icon(Icons.Default.Home, null) }, modifier = Modifier.clickable { fileManager.moveItems(displayItems.filter { selectedItems.contains(it.id) }, null, userPin); refresh(); showMoveDialog = false; isSelectionMode = false }) }; items(folders) { folder -> ListItem(headlineContent = { Text(folder.name) }, leadingContent = { Icon(Icons.Rounded.Folder, null, tint = MaterialTheme.colorScheme.primary) }, modifier = Modifier.clickable { fileManager.moveItems(displayItems.filter { selectedItems.contains(it.id) }, folder.id, userPin); refresh(); showMoveDialog = false; isSelectionMode = false }) } } }, confirmButton = { TextButton(onClick = { showMoveDialog = false }) { Text("Cancel") } }) }
+    if (showAboutDialog) { AlertDialog(onDismissRequest = { showAboutDialog = false }, title = { Text("About VaultX") }, text = { Column(horizontalAlignment = Alignment.CenterHorizontally) { Image(painter = painterResource(id = R.drawable.vaultx), contentDescription = null, modifier = Modifier.size(64.dp)); Spacer(Modifier.height(8.dp)); Text("VaultX v1.1", fontWeight = FontWeight.Bold); Text("Secure Offline Vault", fontSize = 12.sp, color = Color.Gray); Spacer(Modifier.height(16.dp)); Row(modifier = Modifier.clickable { val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Midxv/VaultX")); context.startActivity(i) }.padding(8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Rounded.Code, null, tint = VioletAccent); Spacer(Modifier.width(8.dp)); Text("View Source on GitHub", color = VioletAccent) } } }, confirmButton = { TextButton(onClick = { showAboutDialog = false }) { Text("Close") } }) }
 }
 
 @Composable
-fun AiToolCard(name: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
-    Card(modifier = Modifier.padding(4.dp).clickable { onClick() }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
-        Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(icon, null, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(name, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+fun CuteProgressIndicator(text: String, progress: Float = 0f, indeterminate: Boolean = false) { Card(shape = RoundedCornerShape(50), colors = CardDefaults.cardColors(containerColor = VioletAccent), elevation = CardDefaults.cardElevation(8.dp)) { Row(modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { if (indeterminate) CircularProgressIndicator(modifier = Modifier.size(20.dp), color = TextWhite, strokeWidth = 2.dp) else CircularProgressIndicator(progress = { progress }, modifier = Modifier.size(20.dp), color = TextWhite, strokeWidth = 2.dp, trackColor = Color.White.copy(alpha = 0.3f)); Spacer(Modifier.width(12.dp)); Text(text, color = TextWhite, fontSize = 14.sp, fontWeight = FontWeight.Medium) } } }
+@Composable
+fun ContextMenuItem(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String, tint: Color = TextWhite, onClick: () -> Unit) { Row(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 24.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) { Icon(icon, null, tint = tint, modifier = Modifier.size(24.dp)); Spacer(Modifier.width(24.dp)); Text(text, color = tint, fontSize = 16.sp) } }
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun ListGridItem(item: VaultItem, thumbPath: String?, isSelected: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (isSelected) VioletAccent.copy(alpha = 0.3f) else Color.Transparent)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)).background(DarkGray)) {
+            if (thumbPath != null && File(thumbPath).exists()) AsyncImage(model = File(thumbPath), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+            else Icon(if (item.type == ItemType.FOLDER) Icons.Rounded.Folder else Icons.Default.Image, null, tint = Color.Gray, modifier = Modifier.align(Alignment.Center).size(24.dp))
+        }
+        Spacer(Modifier.width(16.dp))
+        Column {
+            Text(item.name, color = TextWhite, fontWeight = FontWeight.Medium)
+            Text(SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()).format(Date(item.dateModified)), color = Color.Gray, fontSize = 12.sp)
         }
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun VaultGrid(
-    items: List<VaultItem>,
-    allItems: List<VaultItem>,
-    thumbMap: Map<String, String>,
-    selectedItems: Set<String>,
-    isSelectionMode: Boolean,
-    columns: Int,
-    onItemClick: (VaultItem) -> Unit,
-    onLongClick: (VaultItem) -> Unit
-) {
-    LazyVerticalGrid(columns = GridCells.Fixed(columns), contentPadding = PaddingValues(4.dp), modifier = Modifier.fillMaxSize()) {
-        itemsIndexed(items, key = { _, item -> item.id }) { index, item ->
-            // SNAKE ANIMATION
-            val isVisible = remember { mutableStateOf(false) }
-            LaunchedEffect(Unit) { delay(index * 20L); isVisible.value = true }
-
-            val isSelected = selectedItems.contains(item.id)
-            var modelData: Any? = null
-            if (item.type == ItemType.FOLDER) {
-                val last = allItems.filter { it.parentId == item.id && (it.type == ItemType.IMAGE || it.type == ItemType.VIDEO) }.maxByOrNull { it.dateModified }
-                if (last != null) modelData = thumbMap[last.id]?.let { File(it) }
-            } else {
-                modelData = thumbMap[item.id]?.let { File(it) }
-            }
-
-            AnimatedVisibility(
-                visible = isVisible.value,
-                enter = fadeIn(tween(300)) + slideInVertically(tween(300)) { 50 },
-                modifier = Modifier.animateItemPlacement()
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.combinedClickable(onClick = { onItemClick(item) }, onLongClick = { onLongClick(item) })) {
-                    Box(Modifier.padding(2.dp).aspectRatio(1f).clip(RoundedCornerShape(12.dp)).background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant).border(if (isSelected) 2.dp else 0.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp))) {
-                        if (modelData != null) {
-                            AsyncImage(model = ImageRequest.Builder(LocalContext.current).data(modelData).crossfade(true).build(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
-                            if (item.type == ItemType.VIDEO) Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(24.dp).align(Alignment.Center))
-                        } else {
-                            val icon = when(item.type) {
-                                ItemType.FOLDER -> Icons.Default.Lock
-                                ItemType.AUDIO -> Icons.Default.MusicNote
-                                ItemType.PDF -> Icons.Default.Description
-                                else -> Icons.Default.InsertDriveFile
-                            }
-                            Icon(icon, null, tint = Color.Gray, modifier = Modifier.size(32.dp).align(Alignment.Center))
-                        }
-                        if (item.type == ItemType.FOLDER) Icon(Icons.Default.Lock, null, tint = Color.White, modifier = Modifier.size(16.dp).align(Alignment.BottomEnd).padding(2.dp))
-                    }
-                    Text(item.name, maxLines = 1, fontSize = 10.sp, modifier = Modifier.padding(bottom = 8.dp))
-                }
-            }
+fun GlassGridItem(item: VaultItem, thumbPath: String?, isSelected: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+    Column(modifier = Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick)) {
+        Box(Modifier.aspectRatio(1f).clip(RoundedCornerShape(12.dp)).background(DarkGray).border(if(isSelected) 2.dp else 0.dp, VioletAccent, RoundedCornerShape(12.dp))) {
+            if (thumbPath != null && File(thumbPath).exists()) AsyncImage(model = File(thumbPath), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+            else Icon(if (item.type == ItemType.FOLDER) Icons.Rounded.Folder else Icons.Default.Image, null, tint = Color.Gray, modifier = Modifier.align(Alignment.Center).size(48.dp))
+            if (item.type == ItemType.VIDEO) Icon(Icons.Default.PlayArrow, null, tint = TextWhite, modifier = Modifier.align(Alignment.Center))
         }
+        Spacer(Modifier.height(4.dp))
+        Text(text = item.name, color = TextWhite, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 4.dp))
     }
 }
 
-// Helpers
-fun getPathFromUri(context: Context, uri: Uri): String? { try { val cursor = context.contentResolver.query(uri, arrayOf(android.provider.MediaStore.MediaColumns.DATA), null, null, null); cursor?.use { if (it.moveToFirst()) return it.getString(0) } } catch(e: Exception) {}; return null }
-fun getFileMetadata(context: Context, uri: Uri): Pair<String, Long> { var name = "Unknown"; var size = 0L; context.contentResolver.query(uri, null, null, null, null)?.use { cursor -> if (cursor.moveToFirst()) { val ni = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME); val si = cursor.getColumnIndex(OpenableColumns.SIZE); if (ni != -1) name = cursor.getString(ni); if (si != -1) size = cursor.getLong(si) } }; return Pair(name, size) }
-fun detectMimeType(context: Context, uri: Uri): ItemType { val type = context.contentResolver.getType(uri) ?: return ItemType.UNKNOWN; return when { type.startsWith("image/") -> ItemType.IMAGE; type.startsWith("video/") -> ItemType.VIDEO; type.startsWith("audio/") -> ItemType.AUDIO; type.contains("pdf") -> ItemType.PDF; else -> ItemType.UNKNOWN } }
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun VaultGrid(items: List<VaultItem>, thumbMap: Map<String, String>, selectedItems: Set<String>, isSelectionMode: Boolean, columns: Int, onItemClick: (VaultItem) -> Unit, onLongClick: (VaultItem) -> Unit) {
+    LazyVerticalGrid(columns = GridCells.Fixed(columns), contentPadding = PaddingValues(8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        items(items, key = { it.id }) { item ->
+            GlassGridItem(item, thumbMap[item.id], selectedItems.contains(item.id), { if(isSelectionMode) onItemClick(item) else onItemClick(item) }, { onLongClick(item) })
+        }
+    }
+}

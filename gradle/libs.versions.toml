@@ -12,6 +12,7 @@ gson = "2.10.1"
 mlkitImageLabeling = "17.0.8"
 coroutines = "1.7.3"
 material3 = "1.2.1"
+exif = "1.3.7"
 
 # VaultX Dependencies
 coil = "2.6.0"
@@ -22,8 +23,11 @@ navigationCompose = "2.7.7"
 lifecycleProcess = "2.8.0"
 # NEW: Icons
 iconsExtended = "1.6.7"
+osmdroid = "6.1.18"
 
 [libraries]
+androidx-exifinterface = { group = "androidx.exifinterface", name = "exifinterface", version.ref = "exif" }
+osmdroid-android = { group = "org.osmdroid", name = "osmdroid-android", version.ref = "osmdroid" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
 androidx-lifecycle-process = { group = "androidx.lifecycle", name = "lifecycle-process", version.ref = "lifecycleProcess" }

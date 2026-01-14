@@ -38,9 +38,9 @@ android {
 }
 
 dependencies {
+    // --- Core Android UI ---
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
-    implementation(libs.androidx.lifecycle.process)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
@@ -48,21 +48,32 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // VaultX Features
-    implementation(libs.gson)
-    implementation(libs.coil.compose)
-    implementation(libs.coil.video)
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
-    implementation(libs.androidx.material.icons.extended)
-    implementation(libs.androidx.media3.exoplayer)
-    implementation(libs.androidx.media3.ui)
-    implementation(libs.androidx.media3.common)
-    implementation(libs.androidx.biometric)
-    implementation(libs.androidx.security.crypto)
-    implementation(libs.androidx.navigation.compose)
-    implementation(libs.google.mlkit.image.labeling)
-    implementation(libs.kotlinx.coroutines.play.services)
+    // --- VaultX Essentials ---
 
+    // Icons (Crucial for UI)
+    implementation("androidx.compose.material:material-icons-extended:1.6.7")
+
+    // Image & Video Loading (Coil)
+    implementation("io.coil-kt:coil-compose:2.6.0")
+    implementation("io.coil-kt:coil-video:2.6.0")
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
+    implementation("org.osmdroid:osmdroid-android:6.1.18")
+
+    // Encryption & Security
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
+    implementation("androidx.compose.material:material-icons-extended:1.6.7")
+
+    // Media Player (ExoPlayer)
+    implementation("androidx.lifecycle:lifecycle-process:2.8.0")
+    implementation("androidx.media3:media3-exoplayer:1.3.1")
+    implementation("androidx.media3:media3-ui:1.3.1")
+
+    // Concurrency
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+    // --- Testing (Standard) ---
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

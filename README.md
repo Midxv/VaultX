@@ -1,79 +1,50 @@
-# 🛡️ VaultX: Next-Gen AI Secure Vault
+# VaultX 🔒
 
-![Kotlin](https://img.shields.io/badge/Kotlin-1.9.0-purple) ![Compose](https://img.shields.io/badge/Jetpack-Compose-green) ![ML Kit](https://img.shields.io/badge/Google-ML_Kit-orange) ![Security](https://img.shields.io/badge/Security-AES256-red)
+**VaultX** is a secure, offline-first media vault for Android designed to protect your photos and videos with military-grade encryption. It features a modern, "Photos-style" gallery interface, biometric security, and zero-knowledge privacy.
 
-**VaultX** is not just a gallery lock—it is an intelligent, offline fortress for your digital life. Built entirely with **Kotlin** and **Jetpack Compose**, it leverages on-device AI to organize your secured content without a single byte of data ever leaving your phone.
+## ✨ Features
 
-> **"Privacy is not an option, it's the default."**
-
----
-
-## 🚀 Key Features
-
-### 🧠 On-Device AI Intelligence
-* **Smart Search:** Search for "Green Saree", "Cat", or "ID Card" even if you never named the files. The local neural network scans and tags your encrypted content.
-* **Offline Privacy:** All machine learning happens on your device's NPU. No internet required. Zero data leaks.
-
-### ⚡ Turbo Performance
-* **Dual-Thumbnail Engine:**
-    * *Internal Cache:* Unencrypted thumbnails stored in secure app-private storage for instant 120Hz scrolling.
-    * *Encrypted Backup:* Full AES-encrypted thumbnails stored physically for portability.
-* **Zero-Lag Grid:** Custom-built lazy loading architecture using Coil and Coroutines.
-
-### 🔒 Military-Grade Security
-* **AES-256 Encryption:** Every byte of your photos, videos, and documents is encrypted securely.
-* **Screenshot Blocker:** The app renders itself invisible to screen recorders and screenshots.
-* **Biometric Unlock:** Seamless Fingerprint and Face ID integration.
-
-### 🛠️ Power Tools
-* **Private Browser:** Built-in web browser with AdBlock and a direct-to-vault downloader.
-* **Duplicate Finder:** Uses MD5 hashing to find and clean exact duplicates to save space.
-* **Recycle Bin:** Safety net for accidental deletions.
-* **Universal Media Player:** Built-in support for video playback, audio streaming, and secure PDF rendering.
-
----
+* **🛡️ Military-Grade Encryption:** Files are encrypted using AES-256 and filenames are obfuscated.
+* **📶 100% Offline:** No internet permissions required. Your data never leaves your device.
+* **👆 Biometric Unlock:** Secure access with Fingerprint or Face Unlock.
+* **🖼️ Smart Gallery UI:**
+    * Pinch-to-zoom navigation (Tiny, Grid, List views).
+    * Date-based grouping (Today, Yesterday, etc.).
+    * Smooth swiping media viewer with zoom support.
+* **🗑️ Persistent Recycle Bin:** Deleted items are moved to a secure trash folder before permanent deletion.
+* **📂 Album Management:** Create custom albums and organize your media.
+* **🚫 Screenshot Blocker:** Prevents screen recording and screenshots within the app for maximum privacy.
+* **🚀 Efficient Performance:** Handles large imports (1000+ files) without crashing using stream-based encryption.
 
 ## 🛠️ Tech Stack
 
 * **Language:** Kotlin
-* **UI:** Jetpack Compose (Material3)
-* **Image Loading:** Coil (Custom Fetchers for Encrypted Content)
-* **AI/ML:** Google ML Kit (Image Labeling)
-* **Video:** AndroidX Media3 (ExoPlayer)
-* **Database:** SQLite (Custom Implementation)
-* **Cryptography:** `javax.crypto` (AES/CBC/PKCS5Padding)
+* **UI Toolkit:** Jetpack Compose (Material3)
+* **Architecture:** Offline-First, Coroutine-based
+* **Libraries:**
+    * `androidx.security:security-crypto` (Data Encryption)
+    * `io.coil-kt:coil` (Image Loading)
+    * `androidx.media3:media3-exoplayer` (Video Playback)
+    * `androidx.work:work-runtime-ktx` (Background Import/Export)
+    * `org.osmdroid` (Map Visualization)
 
----
+## 📂 Storage Location
 
-## 📸 Screenshots
+Encrypted files are stored securely in your device's internal storage:
+`/storage/emulated/0/DCIM/Vaultx/`
 
-| Secure Grid | AI Search | Private Browser |
-|:-----------:|:---------:|:---------------:|
-| *(Add screenshots here)* | *(Add screenshots here)* | *(Add screenshots here)* |
+*Note: Files in this folder are encrypted (`.enc`) and cannot be opened by gallery apps or file managers without VaultX.*
 
----
+## 🚀 Installation
 
-## 🔧 Installation
-
-1.  Clone the repo:
-    ```bash
-    git clone [https://github.com/Midxv/VaultX.git](https://github.com/Midxv/VaultX.git)
-    ```
+1.  Clone the repository.
 2.  Open in **Android Studio**.
-3.  Sync Gradle and Run on an Emulator or Real Device (Android 8.0+).
-
----
+3.  Sync Gradle and Run on an Android device (Min SDK 26).
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please fork the repository and create a pull request with your features or fixes.
+Contributions are welcome! Please fork the repository and submit a pull request.
 
-1.  Fork the Project
-2.  Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3.  Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4.  Push to the Branch (`git push origin feature/AmazingFeature`)
-5.  Open a Pull Request
+## 📄 License
 
----
-
-*Made with ❤️ and ☕ by Midxv*
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
